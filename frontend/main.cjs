@@ -69,8 +69,13 @@ app.on('will-quit', () => {
   if (pythonProcess) {
     console.log('Killing Python backend...');
     try {
-      // In Windows, we might need to kill the process tree.
-      spawn("taskkill", ["/pid", pythonProcess.pid, '/f', '/t']);
+      if (process.platform === 'win32') {
+        // In Windows, we kill the process tree to ensure it stops.
+        spawn("taskkill", ["/pid", pythonProcess.pid, '/f', '/t']);
+      } else {
+        // On Mac/Linux, a standard kill signal works perfectly.
+        pythonProcess.kill('SIGTERM');
+      }
     } catch (e) {
       pythonProcess.kill();
     }
