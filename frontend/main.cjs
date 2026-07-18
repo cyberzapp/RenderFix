@@ -7,8 +7,10 @@ let mainWindow;
 let pythonProcess;
 
 function startPythonBackend() {
-  // Use the local virtual environment Python
-  const venvPath = path.join(__dirname, '..', 'backend', '.venv', 'Scripts', 'python.exe');
+  const isWindows = process.platform === 'win32';
+  const venvPath = isWindows
+    ? path.join(__dirname, '..', 'backend', '.venv', 'Scripts', 'python.exe')
+    : path.join(__dirname, '..', 'backend', '.venv', 'bin', 'python');
   const systemPython = 'python';
   
   const pythonExecutable = fs.existsSync(venvPath) ? venvPath : systemPython;
