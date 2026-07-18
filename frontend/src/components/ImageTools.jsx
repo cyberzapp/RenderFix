@@ -154,11 +154,14 @@ export default function ImageTools({ onPreviewReady }) {
 
       if (blob.type === 'application/zip') {
         const filename = files.length > 1 ? 'batch_processed.zip' : 'pdf_pages.zip';
-        onPreviewReady ? onPreviewReady(blob, filename, null) : saveAs(blob, filename)
+        saveAs(blob, filename)
       } else {
         const ext = format === 'image/jpeg' ? 'jpg' : format === 'image/webp' ? 'webp' : 'png'
-        const filename = `processed_${files[0].name.split('.')[0]}.${ext}`
-        onPreviewReady ? onPreviewReady(blob, filename, files[0]) : saveAs(blob, filename)
+        const filename = files[0].name.startsWith('processed_') ? files[0].name : `processed_${files[0].name.split('.')[0]}.${ext}`
+        
+        // Update the current file directly instead of opening preview modal
+        const newFile = new File([blob], filename, { type: blob.type })
+        setFiles([newFile])
       }
     } catch (err) {
       alert(err.message)
@@ -237,14 +240,26 @@ export default function ImageTools({ onPreviewReady }) {
                 </div>
               )}
               
-              <button
-                onClick={() => {
-                  setFiles([])
-                }}
-                className="absolute top-4 right-4 bg-black/60 text-white rounded-full w-10 h-10 flex items-center justify-center hover:bg-red-500 transition-colors z-10"
-              >
-                <i className="ph ph-x text-lg"></i>
-              </button>
+              <div className="absolute top-4 right-4 flex gap-2 z-10">
+                {previewUrls[activeIndex] !== 'pdf' && (
+                  <button
+                    onClick={() => saveAs(files[activeIndex], files[activeIndex].name)}
+                    className="bg-black/60 text-white rounded-full w-10 h-10 flex items-center justify-center hover:bg-primary transition-colors shadow-lg"
+                    title="Download Image"
+                  >
+                    <i className="ph-bold ph-download-simple text-lg"></i>
+                  </button>
+                )}
+                <button
+                  onClick={() => {
+                    setFiles([])
+                  }}
+                  className="bg-black/60 text-white rounded-full w-10 h-10 flex items-center justify-center hover:bg-red-500 transition-colors shadow-lg"
+                  title="Remove File"
+                >
+                  <i className="ph-bold ph-x text-lg"></i>
+                </button>
+              </div>
             </div>
           )}
         </div>
@@ -278,19 +293,27 @@ export default function ImageTools({ onPreviewReady }) {
                 Forces output to PNG to preserve transparency. First run will download the AI model.
               </div>
             )}
-            {removeBg && files.length === 1 && (
-              <div className="mt-4 p-4 bg-slate-800/30 rounded-xl border border-slate-700/50 flex flex-col items-center gap-3">
-                <i className="ph-duotone ph-magic-wand text-3xl text-indigo-400"></i>
-                <p className="text-sm text-slate-300 text-center">Want to manually adjust the background mask or use Generative AI?</p>
-                <button 
-                  onClick={() => setShowRefine(true)}
-                  className="px-5 py-2 bg-slate-700 hover:bg-slate-600 rounded-lg text-white font-medium flex items-center gap-2 transition-colors text-sm"
-                >
-                  <i className="ph-bold ph-pencil-simple"></i>
-                  Open Refine Workspace
-                </button>
+          </div>
+
+          <div className="flex flex-col gap-3 bg-slate-800/50 p-4 rounded-xl border border-slate-700/50 shrink-0 cursor-pointer transition-colors hover:border-primary/50 hover:bg-slate-800/80" onClick={() => {
+            if (files.length === 0) {
+               alert("Please upload an image first!");
+               return;
+            }
+            setShowRefine(true);
+          }}>
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-lg flex items-center justify-center transition-colors bg-indigo-600 text-white shadow-[0_0_15px_rgba(79,70,229,0.5)]">
+                  <i className="ph-duotone ph-sparkle text-xl"></i>
+                </div>
+                <div>
+                  <h3 className="font-semibold text-white">Generative AI / Inpaint</h3>
+                  <p className="text-xs text-slate-400">Change outfits, replace objects, or refine mask</p>
+                </div>
               </div>
-            )}
+              <i className="ph-bold ph-caret-right text-slate-400"></i>
+            </div>
           </div>
 
           <div className="flex flex-col gap-2 shrink-0">
@@ -544,7 +567,8 @@ export default function ImageTools({ onPreviewReady }) {
           onClose={() => setShowRefine(false)}
           onSave={(blob) => {
             setShowRefine(false);
-            alert("Refined mask saved! Generative AI backend processing is currently being installed.");
+            const newFile = new File([blob], `refined_${files[activeIndex].name}`, { type: blob.type })
+            setFiles([newFile])
           }}
         />
       )}

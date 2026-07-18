@@ -24,18 +24,6 @@ export default function PreviewModal({ blob, filename, originalFile, onClose }) 
     }
   }, [originalFile]);
 
-  if (!blob || !url) return null;
-
-  const isImage = blob.type.startsWith('image/') && blob.type !== 'image/gif';
-  const isGif = blob.type === 'image/gif';
-  const isVideo = blob.type.startsWith('video/');
-  const isZip = blob.type === 'application/zip';
-
-  const handleDownload = () => {
-    saveAs(blob, filename);
-    onClose();
-  };
-
   const handleMove = (e) => {
     if (!isDragging || !containerRef.current) return;
     const rect = containerRef.current.getBoundingClientRect();
@@ -61,6 +49,18 @@ export default function PreviewModal({ blob, filename, originalFile, onClose }) 
       };
     }
   }, [isDragging]);
+
+  if (!blob || !url) return null;
+
+  const isImage = blob.type.startsWith('image/') && blob.type !== 'image/gif';
+  const isGif = blob.type === 'image/gif';
+  const isVideo = blob.type.startsWith('video/');
+  const isZip = blob.type === 'application/zip';
+
+  const handleDownload = () => {
+    saveAs(blob, filename);
+    onClose();
+  };
 
   const showCompare = isImage && originalUrl;
 

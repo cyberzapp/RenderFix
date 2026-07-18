@@ -11,6 +11,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from moviepy import VideoFileClip
 import math
 from rembg import remove
+import torch
+from diffusers import StableDiffusionInpaintPipeline, StableDiffusionInstructPix2PixPipeline
+from transformers import CLIPSegProcessor, CLIPSegForImageSegmentation
+from PIL import Image, ImageOps
 
 app = FastAPI()
 
@@ -551,6 +555,173 @@ async def process_image(
             headers={"Content-Disposition": "attachment; filename=batch_processed.zip"}
         )
     except Exception as e:
+        return JSONResponse(status_code=500, content={"message": str(e)})
+
+# -----------------------------
+# Advanced Generative AI Models
+# -----------------------------
+sd_inpaint_pipeline = None
+sd_instruct_pipeline = None
+clipseg_processor = None
+clipseg_model = None
+
+def get_sd_inpaint_pipeline():
+    global sd_inpaint_pipeline
+    if sd_inpaint_pipeline is None:
+        print("Loading Stable Diffusion Inpainting model... (This may take a while on first run)")
+        # Using a highly optimized SD Inpainting model for speed and quality on Mac
+        model_id = "runwayml/stable-diffusion-inpainting"
+        sd_inpaint_pipeline = StableDiffusionInpaintPipeline.from_pretrained(
+            model_id, 
+            torch_dtype=torch.float16, 
+            variant="fp16"
+        )
+        sd_inpaint_pipeline = sd_inpaint_pipeline.to("mps")
+        sd_inpaint_pipeline.enable_attention_slicing()
+    return sd_inpaint_pipeline
+
+def get_sd_instruct_pipeline():
+    global sd_instruct_pipeline
+    if sd_instruct_pipeline is None:
+        print("Loading InstructPix2Pix model... (This may take a while on first run)")
+        model_id = "timbrooks/instruct-pix2pix"
+        sd_instruct_pipeline = StableDiffusionInstructPix2PixPipeline.from_pretrained(
+            model_id, 
+            torch_dtype=torch.float16, 
+            safety_checker=None
+        )
+        sd_instruct_pipeline = sd_instruct_pipeline.to("mps")
+        sd_instruct_pipeline.enable_attention_slicing()
+    return sd_instruct_pipeline
+
+def get_clipseg_models():
+    global clipseg_processor, clipseg_model
+    if clipseg_processor is None or clipseg_model is None:
+        print("Loading CLIPSeg model for Auto-Masking...")
+        processor_id = "CIDAS/clipseg-rd64-refined"
+        clipseg_processor = CLIPSegProcessor.from_pretrained(processor_id)
+        clipseg_model = CLIPSegForImageSegmentation.from_pretrained(processor_id)
+    return clipseg_processor, clipseg_model
+
+@app.post("/api/image/inpaint")
+async def inpaint_image(
+    image: UploadFile = File(...),
+    mask: UploadFile = File(...),
+    prompt: str = Form("")
+):
+    try:
+        init_image = Image.open(image.file).convert("RGB")
+        mask_image = Image.open(mask.file).convert("RGB")
+        
+        if init_image.size != mask_image.size:
+            mask_image = mask_image.resize(init_image.size)
+            
+        pipe = get_sd_inpaint_pipeline()
+        
+        actual_prompt = prompt.strip()
+        if not actual_prompt:
+            actual_prompt = "background, seamless, high quality, highly detailed"
+            
+        print(f"Running manual inpainting with prompt: '{actual_prompt}'")
+            
+        output = pipe(
+            prompt=actual_prompt, 
+            image=init_image, 
+            mask_image=mask_image,
+            num_inference_steps=30
+        ).images[0]
+        
+        img_byte_arr = io.BytesIO()
+        output.save(img_byte_arr, format='PNG')
+        img_byte_arr.seek(0)
+        
+        return Response(content=img_byte_arr.getvalue(), media_type="image/png")
+        
+    except Exception as e:
+        print("Error during inpainting:", e)
+        return JSONResponse(status_code=500, content={"message": str(e)})
+
+@app.post("/api/image/smart-edit")
+async def smart_edit_image(
+    image: UploadFile = File(...),
+    edit_type: str = Form("replace_object"), # "replace_object" or "global_edit"
+    target_object: str = Form(""),
+    prompt: str = Form("")
+):
+    try:
+        init_image = Image.open(image.file).convert("RGB")
+        
+        # Max resolution to prevent OOM
+        max_size = 1024
+        if max(init_image.size) > max_size:
+            init_image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+
+        actual_prompt = prompt.strip()
+        
+        if edit_type == "global_edit":
+            print(f"Running InstructPix2Pix with prompt: '{actual_prompt}'")
+            pipe = get_sd_instruct_pipeline()
+            output = pipe(
+                prompt=actual_prompt,
+                image=init_image,
+                num_inference_steps=30,
+                image_guidance_scale=1.5
+            ).images[0]
+            
+        elif edit_type == "replace_object":
+            if not target_object.strip():
+                return JSONResponse(status_code=400, content={"message": "Target object is required for Auto-Masking."})
+                
+            print(f"Running CLIPSeg for '{target_object}'...")
+            processor, model = get_clipseg_models()
+            
+            # Predict mask
+            inputs = processor(text=[target_object.strip()], images=[init_image], padding="max_length", return_tensors="pt")
+            with torch.no_grad():
+                outputs = model(**inputs)
+            
+            # Process output mask
+            preds = outputs.logits.unsqueeze(1)
+            preds = torch.sigmoid(preds[0][0])
+            mask = preds.cpu().numpy()
+            
+            # Normalize and threshold mask
+            mask = (mask - mask.min()) / (mask.max() - mask.min())
+            mask = (mask > 0.4).astype(np.uint8) * 255
+            
+            # Convert mask to PIL Image and resize to match init_image
+            mask_image = Image.fromarray(mask).convert("L")
+            mask_image = mask_image.resize(init_image.size, Image.Resampling.LANCZOS)
+            
+            # Expand mask slightly for smoother inpainting (dilate)
+            mask_np = np.array(mask_image)
+            kernel = np.ones((15, 15), np.uint8)
+            mask_np = cv2.dilate(mask_np, kernel, iterations=1)
+            mask_image = Image.fromarray(mask_np).convert("RGB")
+            
+            print(f"Running Inpainting with prompt: '{actual_prompt}'")
+            pipe = get_sd_inpaint_pipeline()
+            output = pipe(
+                prompt=actual_prompt,
+                image=init_image,
+                mask_image=mask_image,
+                num_inference_steps=30
+            ).images[0]
+            
+        else:
+            return JSONResponse(status_code=400, content={"message": "Invalid edit_type."})
+
+        # Save output to bytes
+        img_byte_arr = io.BytesIO()
+        output.save(img_byte_arr, format='PNG')
+        img_byte_arr.seek(0)
+        
+        return Response(content=img_byte_arr.getvalue(), media_type="image/png")
+        
+    except Exception as e:
+        print("Error during smart edit:", e)
+        import traceback
+        traceback.print_exc()
         return JSONResponse(status_code=500, content={"message": str(e)})
 
 if __name__ == "__main__":

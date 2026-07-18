@@ -5,6 +5,7 @@ import Controls from './components/Controls'
 import ImageTools from './components/ImageTools'
 import PreviewModal from './components/PreviewModal'
 import { saveAs } from 'file-saver'
+import { ErrorBoundary } from './ErrorBoundary'
 
 function App() {
   const [previewData, setPreviewData] = useState(null)
@@ -83,7 +84,7 @@ function App() {
     }
   }
 
-  const handleExportMultiple = async (fps, format) => {
+  const handleExportMultiple = async (fps, format, options = {}) => {
     if (!videoFile || isProcessing) return;
     setIsProcessing(true);
 
@@ -168,7 +169,8 @@ function App() {
   }
 
   return (
-    <div className="max-w-7xl mx-auto p-8 flex flex-col gap-8">
+    <ErrorBoundary>
+      <div className="max-w-7xl mx-auto p-8 flex flex-col gap-8">
       <header className="flex flex-col items-center text-center animate-fade-in-down mb-2">
         <div className="flex items-center gap-3 text-4xl text-primary mb-2">
           <i className="ph-fill ph-film-strip drop-shadow-[0_0_10px_rgba(99,102,241,0.5)]"></i>
@@ -245,6 +247,7 @@ function App() {
         />
       )}
     </div>
+    </ErrorBoundary>
   )
 }
 

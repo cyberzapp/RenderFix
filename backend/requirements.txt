@@ -5,3 +5,9 @@ python-multipart
 moviepy
 pymupdf
 rembg[cpu]
+torch
+torchvision
+torchaudio
+diffusers
+transformers
+accelerate
