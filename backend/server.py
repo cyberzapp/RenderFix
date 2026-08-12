@@ -12,9 +12,10 @@ from moviepy import VideoFileClip
 import math
 from rembg import remove
 import torch
-from diffusers import StableDiffusionInpaintPipeline, StableDiffusionInstructPix2PixPipeline
+from diffusers import StableDiffusionInpaintPipeline, StableDiffusionInstructPix2PixPipeline, StableDiffusionXLPipeline, EulerDiscreteScheduler
 from transformers import CLIPSegProcessor, CLIPSegForImageSegmentation
 from PIL import Image, ImageOps
+import json
 
 app = FastAPI()
 
@@ -562,8 +563,81 @@ async def process_image(
 # -----------------------------
 sd_inpaint_pipeline = None
 sd_instruct_pipeline = None
-clipseg_processor = None
-clipseg_model = None
+class UnifiedModelManager:
+    def __init__(self):
+        self.sdxl_pipe = None
+        self.sdxl_inpaint_pipe = None
+        self.face_app = None
+        self.sam_processor = None
+        self.sam_model = None
+
+    def get_sam_processor(self):
+        if self.sam_processor is None:
+            from transformers import SamProcessor
+            print("Loading SAM Processor...")
+            self.sam_processor = SamProcessor.from_pretrained("facebook/sam-vit-base")
+        return self.sam_processor
+
+    def get_sam_model(self):
+        if self.sam_model is None:
+            from transformers import SamModel
+            print("Loading SAM Model...")
+            self.sam_model = SamModel.from_pretrained("facebook/sam-vit-base").to("mps")
+        return self.sam_model
+
+    def get_face_app(self):
+        if self.face_app is None:
+            import insightface
+            from insightface.app import FaceAnalysis
+            print("Loading InsightFace Model...")
+            self.face_app = FaceAnalysis(name="buffalo_l", providers=['CPUExecutionProvider'])
+            self.face_app.prepare(ctx_id=0, det_size=(640, 640))
+        return self.face_app
+
+    def get_sdxl_pipeline(self):
+        if self.sdxl_pipe is None:
+            print("Loading SDXL-Lightning with IP-Adapter-FaceID... (This may take a while on first run)")
+            base = "stabilityai/stable-diffusion-xl-base-1.0"
+            repo = "ByteDance/SDXL-Lightning"
+            
+            from diffusers import StableDiffusionXLPipeline, EulerDiscreteScheduler
+            self.sdxl_pipe = StableDiffusionXLPipeline.from_pretrained(
+                base, 
+                torch_dtype=torch.float16,
+                variant="fp16"
+            ).to("mps")
+            
+            self.sdxl_pipe.scheduler = EulerDiscreteScheduler.from_config(
+                self.sdxl_pipe.scheduler.config, 
+                timestep_spacing="trailing"
+            )
+            
+            self.sdxl_pipe.load_lora_weights(repo, weight_name="sdxl_lightning_4step_lora.safetensors")
+            self.sdxl_pipe.fuse_lora()
+            
+            # Load the FaceID adapter (requires image_encoder=None)
+            self.sdxl_pipe.load_ip_adapter(
+                "h94/IP-Adapter-FaceID", 
+                subfolder=None, 
+                weight_name="ip-adapter-faceid_sdxl.bin",
+                image_encoder_folder=None
+            )
+            
+            self.sdxl_pipe.enable_model_cpu_offload()
+            self.sdxl_pipe.enable_attention_slicing()
+            
+        return self.sdxl_pipe
+
+    def get_sdxl_inpaint_pipeline(self):
+        if self.sdxl_inpaint_pipe is None:
+            base_pipe = self.get_sdxl_pipeline()
+            from diffusers import AutoPipelineForInpainting
+            self.sdxl_inpaint_pipe = AutoPipelineForInpainting.from_pipe(base_pipe)
+            self.sdxl_inpaint_pipe.enable_model_cpu_offload()
+            self.sdxl_inpaint_pipe.enable_attention_slicing()
+        return self.sdxl_inpaint_pipe
+
+model_manager = UnifiedModelManager()
 
 def get_sd_inpaint_pipeline():
     global sd_inpaint_pipeline
@@ -719,7 +793,214 @@ async def smart_edit_image(
         return Response(content=img_byte_arr.getvalue(), media_type="image/png")
         
     except Exception as e:
-        print("Error during smart edit:", e)
+        print(f"Smart Edit Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"message": str(e)})
+
+@app.post("/api/image/advanced-composite")
+async def advanced_composite(
+    prompt: str = Form(...),
+    references_meta: str = Form(...), # JSON string of labels and types
+    base_image: UploadFile = File(None),
+    reference_images: Optional[List[UploadFile]] = File(None),
+    reference_masks: Optional[List[UploadFile]] = File(None)
+):
+    try:
+        print(f"Backend: Running Advanced Compositor with prompt: '{prompt}'")
+        meta = json.loads(references_meta)
+        
+        # Load images
+        loaded_images = []
+        if reference_images:
+            for file in reference_images:
+                content = await file.read()
+            img = Image.open(io.BytesIO(content)).convert("RGB")
+            # Resize references to save memory during processing
+            img.thumbnail((512, 512), Image.Resampling.LANCZOS)
+            loaded_images.append(img)
+            
+        pipe = model_manager.get_sdxl_pipeline()
+        face_app = model_manager.get_face_app()
+        
+        # Configure IP-Adapter
+        pipe.set_ip_adapter_scale(0.6)
+        
+        # We append the labels to the prompt for better guidance
+        augmented_prompt = prompt
+        
+        face_embeds = []
+        for i, m in enumerate(meta):
+            augmented_prompt += f", {m['label']} style"
+            
+            # Extract face ID using InsightFace
+            cv_img = cv2.cvtColor(np.array(loaded_images[i]), cv2.COLOR_RGB2BGR)
+            faces = face_app.get(cv_img)
+            
+            if len(faces) > 0:
+                print(f"Detected face for {m['label']}")
+                face_embed = torch.from_numpy(faces[0].normed_embedding).unsqueeze(0)
+                face_embeds.append(face_embed)
+            else:
+                print(f"No face detected in {m['label']}, falling back to zero embedding")
+                face_embeds.append(torch.zeros((1, 512)))
+                
+        print(f"Final Prompt: {augmented_prompt}")
+        
+        # Stack embeddings
+        if len(face_embeds) > 0:
+            faceid_embeds = torch.cat(face_embeds, dim=0)
+        else:
+            faceid_embeds = None
+
+        # Read provided masks
+        mask_images = []
+        if reference_masks:
+            for file in reference_masks:
+                content = await file.read()
+                m = Image.open(io.BytesIO(content)).convert("L")
+                mask_images.append(m)
+
+        # Prepare dummy masks if none provided from frontend yet (future-proofing for Phase 3)
+        # IPAdapterMaskProcessor expects a list of PIL Images (binary masks)
+        from diffusers.image_processor import IPAdapterMaskProcessor
+        mask_processor = IPAdapterMaskProcessor()
+        
+        cross_attention_kwargs = None
+        
+        if len(mask_images) > 0:
+            print("Applying Regional Masking...")
+            # We must process masks to match the height and width of the output (1024x1024 for SDXL)
+            processed_masks = mask_processor.preprocess(mask_images, height=1024, width=1024)
+            # Add dummy empty masks for references that don't have masks, to keep shapes aligned
+            # (diffusers IPAdapter masking logic is complex, for simplicity we just pass the masks we have)
+            cross_attention_kwargs = {"ip_adapter_masks": processed_masks}
+        
+        # Hardcoded structural negative prompt for Nano-Banana quality
+        negative_prompt = "(deformed, distorted, disfigured:1.3), poorly drawn, bad anatomy, wrong proportions, extra limbs, ugly, mutated"
+
+        # Determine if we are doing img2img/inpainting or txt2img
+        if base_image and len(mask_images) > 0:
+            print("Running Regional IP-Adapter Inpainting...")
+            content = await base_image.read()
+            init_img = Image.open(io.BytesIO(content)).convert("RGB").resize((1024, 1024))
+            
+            # Combine all masks into one global mask for the inpainting model
+            global_mask = np.zeros((1024, 1024), dtype=np.uint8)
+            
+            # Smart FaceID Logic: If we are masking the body, we do NOT want FaceID to generate a face inside the body.
+            # We check if any reference actually has type 'face'. In the new UI, we will track this.
+            # For now, if the mask is just for clothes, applying face_embeds will destroy it.
+            # Let's apply FaceID ONLY if the mask corresponds to a 'face' type reference, otherwise None.
+            has_face_mask = any('face' in r.get('type', '') for r in refs_meta)
+            
+            for m in mask_images:
+                global_mask = np.maximum(global_mask, np.array(m.resize((1024, 1024))))
+            global_mask_pil = Image.fromarray(global_mask)
+            
+            inpaint_pipe = model_manager.get_sdxl_inpaint_pipeline()
+            inpaint_pipe.set_ip_adapter_scale(0.6)
+            
+            result = inpaint_pipe(
+                prompt=augmented_prompt,
+                negative_prompt=negative_prompt,
+                image=init_img,
+                mask_image=global_mask_pil,
+                ip_adapter_image_embeds=[faceid_embeds] if (faceid_embeds is not None and has_face_mask) else None,
+                num_inference_steps=4,
+                guidance_scale=0,
+                strength=0.99, # Crucial for Lightning 4-step inpainting
+                cross_attention_kwargs=cross_attention_kwargs if has_face_mask else None
+            ).images[0]
+        else:
+            print("Running Regional IP-Adapter Text2Image...")
+            # Generate image using Lightning (4 steps)
+            result = pipe(
+                prompt=augmented_prompt,
+                negative_prompt=negative_prompt,
+                ip_adapter_image_embeds=[faceid_embeds] if faceid_embeds is not None else None,
+                num_inference_steps=4,
+                guidance_scale=0, # Lightning requires 0 guidance scale
+                cross_attention_kwargs=cross_attention_kwargs
+            ).images[0]
+        
+        # Encode result
+        img_byte_arr = io.BytesIO()
+        result.save(img_byte_arr, format='PNG')
+        img_byte_arr.seek(0)
+        
+        # Flush to free memory
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+            import gc
+            gc.collect()
+            
+        return Response(content=img_byte_arr.getvalue(), media_type="image/png")
+        
+    except Exception as e:
+        print(f"Advanced Composite Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"message": str(e)})
+
+@app.post("/api/image/segment")
+async def segment_image(
+    image: UploadFile = File(...),
+    points: str = Form(...) # JSON string of [[x, y], [x, y]]
+):
+    try:
+        content = await image.read()
+        img = Image.open(io.BytesIO(content)).convert("RGB")
+        
+        pts = json.loads(points)
+        if not pts:
+            return JSONResponse(status_code=400, content={"message": "No points provided"})
+            
+        processor = model_manager.get_sam_processor()
+        model = model_manager.get_sam_model()
+        
+        # SAM expects points as [[[x, y]]]
+        input_points = [[pts]]
+        inputs = processor(img, input_points=input_points, return_tensors="pt").to("mps")
+        
+        with torch.no_grad():
+            outputs = model(**inputs)
+            
+        # The output masks are of shape [batch, 1, num_masks, height, width]
+        masks = processor.image_processor.post_process_masks(
+            outputs.pred_masks.cpu(), 
+            inputs["original_sizes"].cpu(), 
+            inputs["reshaped_input_sizes"].cpu()
+        )
+        
+        # We take the mask with the highest score (typically the first or last depending on output structure)
+        # outputs.iou_scores is [batch, 1, num_masks]
+        best_mask_idx = torch.argmax(outputs.iou_scores[0, 0]).item()
+        best_mask = masks[0][0, best_mask_idx].numpy()
+        
+        # Convert binary mask to an image (black and white)
+        mask_img = (best_mask * 255).astype(np.uint8)
+        mask_pil = Image.fromarray(mask_img)
+        
+        # Dilate mask slightly for seamless blending in downstream tasks
+        mask_cv = np.array(mask_pil)
+        kernel = np.ones((5,5), np.uint8)
+        dilated_mask = cv2.dilate(mask_cv, kernel, iterations=1)
+        dilated_pil = Image.fromarray(dilated_mask)
+        
+        img_byte_arr = io.BytesIO()
+        dilated_pil.save(img_byte_arr, format='PNG')
+        img_byte_arr.seek(0)
+        
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+            import gc
+            gc.collect()
+            
+        return Response(content=img_byte_arr.getvalue(), media_type="image/png")
+        
+    except Exception as e:
+        print(f"SAM Error: {str(e)}")
         import traceback
         traceback.print_exc()
         return JSONResponse(status_code=500, content={"message": str(e)})
