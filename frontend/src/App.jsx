@@ -19,6 +19,7 @@ function App() {
   const [activeTab, setActiveTab] = useState('video')
   
   const videoRef = useRef(null)
+  const reuploadInputRef = useRef(null)
   const [isPlaying, setIsPlaying] = useState(false)
 
   const handleTogglePlay = () => {
@@ -44,6 +45,9 @@ function App() {
       setVideoUrl(URL.createObjectURL(file))
       setWatermarkRegion(null)
       setCurrentTime(0)
+      setDuration(0)
+      setIsPlaying(false)
+      setPreviewData(null)
     } else {
       alert("Please upload a valid video file.")
     }
@@ -203,16 +207,38 @@ function App() {
               {!videoUrl ? (
                 <VideoUploader onUpload={handleFileUpload} />
               ) : (
-                <VideoPlayer 
-                  src={videoUrl} 
-                  videoRef={videoRef}
-                  watermarkRegion={watermarkRegion}
-                  setWatermarkRegion={setWatermarkRegion}
-                  onTimeUpdate={setCurrentTime}
-                  onDurationChange={setDuration}
-                  isPlaying={isPlaying}
-                  setIsPlaying={setIsPlaying}
-                />
+                <>
+                  <VideoPlayer 
+                    src={videoUrl} 
+                    videoRef={videoRef}
+                    watermarkRegion={watermarkRegion}
+                    setWatermarkRegion={setWatermarkRegion}
+                    onTimeUpdate={setCurrentTime}
+                    onDurationChange={setDuration}
+                    isPlaying={isPlaying}
+                    setIsPlaying={setIsPlaying}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => reuploadInputRef.current?.click()}
+                    disabled={isProcessing}
+                    className="absolute top-4 right-4 z-10 inline-flex items-center gap-2 rounded-lg border border-white/15 bg-slate-950/75 px-3 py-2 text-sm font-medium text-white shadow-lg backdrop-blur transition-colors hover:bg-primary disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <i className="ph ph-arrow-clockwise"></i>
+                    Reupload video
+                  </button>
+                  <input
+                    ref={reuploadInputRef}
+                    type="file"
+                    accept="video/*"
+                    className="hidden"
+                    onChange={(event) => {
+                      const file = event.target.files?.[0]
+                      if (file) handleFileUpload(file)
+                      event.target.value = ''
+                    }}
+                  />
+                </>
               )}
             </div>
           </section>
