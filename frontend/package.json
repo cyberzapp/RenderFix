@@ -9,7 +9,8 @@
     "build": "vite build",
     "lint": "oxlint",
     "preview": "vite preview",
-    "desktop": "concurrently \"npm run dev\" \"wait-on tcp:5173 && cross-env ELECTRON_RUN_AS_NODE= electron .\""
+    "desktop": "concurrently \"npm run dev -- --strictPort\" \"wait-on tcp:5173 && cross-env ELECTRON_RUN_AS_NODE= electron .\"",
+    "package:mac": "bash ./package_mac.sh"
   },
   "dependencies": {
     "@phosphor-icons/web": "^2.1.2",
@@ -26,10 +27,42 @@
     "concurrently": "^10.0.3",
     "cross-env": "^10.1.0",
     "electron": "^43.1.1",
+    "electron-builder": "^26.18.0",
     "oxlint": "^1.71.0",
     "postcss": "^8.5.19",
     "tailwindcss": "^4.3.3",
     "vite": "^8.1.1",
     "wait-on": "^9.0.10"
+  },
+  "build": {
+    "appId": "com.renderfix.desktop",
+    "productName": "RenderFix",
+    "directories": {
+      "buildResources": "build",
+      "output": "release"
+    },
+    "files": [
+      "main.cjs",
+      "dist/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "build/backend-path.txt",
+        "to": "backend-path.txt"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.video",
+      "icon": "build/icon.icns",
+      "target": [
+        {
+          "target": "dir",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ]
+    }
   }
 }

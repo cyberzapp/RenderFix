@@ -7,11 +7,37 @@ import PreviewModal from './components/PreviewModal'
 import { saveAs } from 'file-saver'
 import { ErrorBoundary } from './ErrorBoundary'
 
+const appendRemovalMask = (formData, mask, padding, feather) => {
+  if (!mask) return
+  if (mask.type === 'polygon') {
+    formData.append('mask_points', JSON.stringify(mask.points.map(({ x, y }) => [x, y])))
+  } else {
+    formData.append('x', mask.x)
+    formData.append('y', mask.y)
+    formData.append('w', mask.w)
+    formData.append('h', mask.h)
+  }
+  formData.append('mask_padding', padding)
+  formData.append('mask_feather', feather)
+}
+
+const decodeImageBlob = (base64, mediaType) => {
+  const binary = atob(base64)
+  const bytes = new Uint8Array(binary.length)
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index)
+  }
+  return new Blob([bytes], { type: mediaType })
+}
+
 function App() {
   const [previewData, setPreviewData] = useState(null)
   const [videoFile, setVideoFile] = useState(null)
   const [videoUrl, setVideoUrl] = useState(null)
   const [watermarkRegion, setWatermarkRegion] = useState(null) // {x, y, w, h}
+  const [maskTool, setMaskTool] = useState('rectangle')
+  const [maskPadding, setMaskPadding] = useState(4)
+  const [maskFeather, setMaskFeather] = useState(2)
   const [isProcessing, setIsProcessing] = useState(false)
   const [currentTime, setCurrentTime] = useState(0)
   const [duration, setDuration] = useState(0)
@@ -63,12 +89,7 @@ function App() {
     formData.append('format', format);
     formData.append('scale', isUpscale ? 2.0 : 1.0);
     
-    if (watermarkRegion) {
-      formData.append('x', watermarkRegion.x);
-      formData.append('y', watermarkRegion.y);
-      formData.append('w', watermarkRegion.w);
-      formData.append('h', watermarkRegion.h);
-    }
+    appendRemovalMask(formData, watermarkRegion, maskPadding, maskFeather)
 
     try {
       const response = await fetch('http://localhost:8000/api/export/single', {
@@ -88,6 +109,47 @@ function App() {
     }
   }
 
+  const handlePreviewRemoval = async () => {
+    if (!videoFile || !watermarkRegion || isProcessing) return
+    if (videoRef.current && !videoRef.current.paused) videoRef.current.pause()
+    setIsPlaying(false)
+    setIsProcessing(true)
+
+    const timestamp = videoRef.current?.currentTime ?? currentTime
+    const formData = new FormData()
+    formData.append('file', videoFile)
+    formData.append('timestamp', timestamp)
+    formData.append('format', 'image/jpeg')
+    formData.append('compare', 'true')
+    appendRemovalMask(formData, watermarkRegion, maskPadding, maskFeather)
+
+    try {
+      const response = await fetch('http://localhost:8000/api/export/single', {
+        method: 'POST',
+        body: formData,
+      })
+
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({}))
+        throw new Error(error.message || 'Failed to prepare the removal preview')
+      }
+
+      const comparison = await response.json()
+      const originalFile = decodeImageBlob(comparison.original, comparison.media_type)
+      const blob = decodeImageBlob(comparison.processed, comparison.media_type)
+      setPreviewData({
+        blob,
+        filename: `Removal preview at ${timestamp.toFixed(2)}s`,
+        originalFile,
+        previewOnly: true,
+      })
+    } catch (error) {
+      alert(error.message)
+    } finally {
+      setIsProcessing(false)
+    }
+  }
+
   const handleExportMultiple = async (fps, format, options = {}) => {
     if (!videoFile || isProcessing) return;
     setIsProcessing(true);
@@ -98,12 +160,7 @@ function App() {
     formData.append('format', format);
     formData.append('scale', isUpscale ? 2.0 : 1.0);
     
-    if (watermarkRegion) {
-      formData.append('x', watermarkRegion.x);
-      formData.append('y', watermarkRegion.y);
-      formData.append('w', watermarkRegion.w);
-      formData.append('h', watermarkRegion.h);
-    }
+    appendRemovalMask(formData, watermarkRegion, maskPadding, maskFeather)
     
     if (options.startTime !== undefined && options.startTime !== '') formData.append('start_time', options.startTime);
     if (options.endTime !== undefined && options.endTime !== '') formData.append('end_time', options.endTime);
@@ -139,13 +196,9 @@ function App() {
     formData.append('file', videoFile);
     formData.append('scale', isUpscale ? 2.0 : 1.0);
     formData.append('format', format);
+    formData.append('processing_method', options.processingMethod || 'opencv');
     
-    if (watermarkRegion) {
-      formData.append('x', watermarkRegion.x);
-      formData.append('y', watermarkRegion.y);
-      formData.append('w', watermarkRegion.w);
-      formData.append('h', watermarkRegion.h);
-    }
+    appendRemovalMask(formData, watermarkRegion, maskPadding, maskFeather)
     
     if (options.startTime !== undefined && options.startTime !== '') formData.append('start_time', options.startTime);
     if (options.endTime !== undefined && options.endTime !== '') formData.append('end_time', options.endTime);
@@ -160,7 +213,10 @@ function App() {
         body: formData,
       });
 
-      if (!response.ok) throw new Error("Failed to export video");
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error.message || "Failed to export video");
+      }
       
       const blob = await response.blob();
       const filename = format === 'image/gif' ? 'exported.gif' : 'cleaned_video.mp4';
@@ -213,6 +269,7 @@ function App() {
                     videoRef={videoRef}
                     watermarkRegion={watermarkRegion}
                     setWatermarkRegion={setWatermarkRegion}
+                    maskTool={maskTool}
                     onTimeUpdate={setCurrentTime}
                     onDurationChange={setDuration}
                     isPlaying={isPlaying}
@@ -248,6 +305,7 @@ function App() {
               onExportSingle={handleExportSingle}
               onExportMultiple={handleExportMultiple}
               onExportVideo={handleExportVideo}
+              onPreviewRemoval={handlePreviewRemoval}
               isProcessing={isProcessing}
               hasVideo={!!videoFile}
               duration={duration}
@@ -257,6 +315,13 @@ function App() {
               setIsUpscale={setIsUpscale}
               onTogglePlay={handleTogglePlay}
               onSeek={handleSeek}
+              removalMask={watermarkRegion}
+              maskTool={maskTool}
+              setMaskTool={setMaskTool}
+              maskPadding={maskPadding}
+              setMaskPadding={setMaskPadding}
+              maskFeather={maskFeather}
+              setMaskFeather={setMaskFeather}
             />
           </section>
         </main>
@@ -269,6 +334,7 @@ function App() {
           blob={previewData.blob} 
           filename={previewData.filename} 
           originalFile={previewData.originalFile}
+          previewOnly={previewData.previewOnly}
           onClose={() => setPreviewData(null)} 
         />
       )}

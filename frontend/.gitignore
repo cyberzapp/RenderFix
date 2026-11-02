@@ -10,6 +10,9 @@ lerna-debug.log*
 node_modules
 dist
 dist-ssr
+release
+build/backend-path.txt
+build/RenderFix.iconset
 *.local
 
 # Editor directories and files

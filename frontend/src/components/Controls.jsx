@@ -1,9 +1,10 @@
 import React, { useState } from 'react'
 
-export default function Controls({ onExportSingle, onExportMultiple, onExportVideo, isProcessing, hasVideo, duration, currentTime, isPlaying, isUpscale, setIsUpscale, onTogglePlay, onSeek }) {
+export default function Controls({ onExportSingle, onExportMultiple, onExportVideo, onPreviewRemoval, isProcessing, hasVideo, duration, currentTime, isPlaying, isUpscale, setIsUpscale, onTogglePlay, onSeek, removalMask, maskTool, setMaskTool, maskPadding, setMaskPadding, maskFeather, setMaskFeather }) {
   const [fps, setFps] = useState(1.0)
   const [format, setFormat] = useState('image/png')
   const [videoFormat, setVideoFormat] = useState('video/mp4')
+  const [processingMethod, setProcessingMethod] = useState('opencv')
   
   const [startTime, setStartTime] = useState('')
   const [endTime, setEndTime] = useState('')
@@ -112,6 +113,100 @@ export default function Controls({ onExportSingle, onExportMultiple, onExportVid
       </div>
 
       <div className="h-px bg-slate-700 w-full"></div>
+
+      <div className="flex flex-col gap-4 bg-slate-800/30 p-4 rounded-xl border border-slate-700/30">
+        <div className="flex flex-col gap-1">
+          <h3 className="font-semibold text-slate-200 text-sm">Remove Watermark or Object</h3>
+          <p className="text-xs text-slate-400">
+            Draw a rectangle or outline the area on the video, then preview the current frame. The mask stays at the same position throughout the export.
+          </p>
+        </div>
+
+        <label className="flex flex-col gap-2 text-xs text-slate-400">
+          Video removal method
+          <select
+            value={processingMethod}
+            onChange={(event) => setProcessingMethod(event.target.value)}
+            disabled={!hasVideo}
+            className="w-full bg-dark border border-slate-700 rounded-lg py-2 px-3 text-white focus:outline-none focus:border-primary disabled:opacity-50"
+          >
+            <option value="opencv">Fast · OpenCV (frame by frame)</option>
+            <option value="propainter">Temporal · ProPainter (slower)</option>
+          </select>
+          {processingMethod === 'propainter' ? (
+            <span className="text-[11px] text-amber-300/80">
+              Uses motion across frames. Requires the optional ProPainter setup, runs at reduced resolution, and is licensed for non-commercial use only.
+            </span>
+          ) : (
+            <span className="text-[11px] text-slate-500">
+              Fast local fill; each frame is repaired independently.
+            </span>
+          )}
+        </label>
+
+        <label className="flex flex-col gap-2 text-xs text-slate-400">
+          Mask shape
+          <select
+            value={maskTool}
+            onChange={(event) => setMaskTool(event.target.value)}
+            disabled={!hasVideo}
+            className="w-full bg-dark border border-slate-700 rounded-lg py-2 px-3 text-white focus:outline-none focus:border-primary disabled:opacity-50"
+          >
+            <option value="rectangle">Rectangle · drag on video</option>
+            <option value="polygon">Polygon · click outline points</option>
+          </select>
+        </label>
+
+        <div className="flex flex-col gap-2">
+          <label className="flex items-center justify-between text-xs text-slate-400" htmlFor="mask-padding">
+            <span>Mask padding</span><span className="font-semibold text-primary">{maskPadding} px</span>
+          </label>
+          <input
+            id="mask-padding"
+            type="range"
+            min="0"
+            max="32"
+            step="1"
+            value={maskPadding}
+            onChange={(event) => setMaskPadding(parseInt(event.target.value, 10))}
+            disabled={!hasVideo || !removalMask}
+            className="w-full h-1.5 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-primary disabled:opacity-50"
+          />
+          <p className="text-[11px] text-slate-500">Expand the fill area beyond the selected edge.</p>
+        </div>
+
+        <div className="flex flex-col gap-2">
+          <label className="flex items-center justify-between text-xs text-slate-400" htmlFor="mask-feather">
+            <span>Edge feather</span><span className="font-semibold text-primary">{maskFeather} px</span>
+          </label>
+          <input
+            id="mask-feather"
+            type="range"
+            min="0"
+            max="16"
+            step="1"
+            value={maskFeather}
+            onChange={(event) => setMaskFeather(parseInt(event.target.value, 10))}
+            disabled={!hasVideo || !removalMask}
+            className="w-full h-1.5 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-primary disabled:opacity-50"
+          />
+          <p className="text-[11px] text-slate-500">Blend the filled edge into the original frame.</p>
+        </div>
+
+        <button
+          type="button"
+          onClick={onPreviewRemoval}
+          disabled={!hasVideo || !removalMask || isProcessing}
+          className="flex items-center justify-center gap-2 w-full py-2.5 px-4 rounded-lg font-semibold text-sm bg-primary/15 text-primary border border-primary/30 hover:bg-primary hover:text-white transition-colors disabled:cursor-not-allowed disabled:opacity-45"
+        >
+          {isProcessing ? <i className="ph-duotone ph-spinner-gap animate-spin"></i> : <i className="ph ph-eye"></i>}
+          {isProcessing ? 'Preparing preview…' : 'Preview removal'}
+        </button>
+        {!removalMask && <p className="text-center text-xs text-slate-500">Select an area on the video to enable preview.</p>}
+        {processingMethod === 'propainter' && <p className="text-center text-xs text-slate-500">The current-frame preview uses the fast OpenCV method; the video export uses the selected method.</p>}
+      </div>
+
+      <div className="h-px bg-slate-700 w-full"></div>
       
       {/* Trimming & Watermarking */}
       <div className="flex flex-col gap-4 bg-slate-800/30 p-4 rounded-xl border border-slate-700/30">
@@ -194,12 +289,12 @@ export default function Controls({ onExportSingle, onExportMultiple, onExportVid
             <option value="image/gif">GIF</option>
           </select>
           <button 
-            onClick={() => onExportVideo(videoFormat, { startTime, endTime, watermarkText, watermarkPosition })}
+            onClick={() => onExportVideo(videoFormat, { startTime, endTime, watermarkText, watermarkPosition, processingMethod })}
             disabled={!hasVideo || isProcessing}
             className="w-2/3 bg-slate-700 hover:bg-slate-600 text-white font-semibold py-3 px-4 rounded-lg transition-all flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed text-sm"
           >
             {isProcessing ? <i className="ph-duotone ph-spinner-gap animate-spin"></i> : <i className="ph ph-video-camera"></i>}
-            {isProcessing ? "Processing..." : `Export ${videoFormat === 'image/gif' ? 'GIF' : 'Video'}`}
+            {isProcessing ? (processingMethod === 'propainter' ? 'Temporal fill running…' : 'Processing...') : `Export ${videoFormat === 'image/gif' ? 'GIF' : 'Video'}`}
           </button>
         </div>
       </div>

@@ -1,1 +1,3 @@
 .venv
+.propainter/
+__pycache__/

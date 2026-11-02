@@ -1,10 +1,15 @@
 import os
 import cv2
 import numpy as np
+import base64
 import tempfile
 import io
 import zipfile
+import shutil
+import subprocess
+import asyncio
 from typing import List
+from pathlib import Path
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.responses import Response, JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,6 +24,16 @@ import json
 
 app = FastAPI()
 
+BACKEND_DIR = Path(__file__).resolve().parent
+PROPAINTER_DIR = Path(os.environ.get(
+    "RENDERFIX_PROPAINTER_DIR",
+    BACKEND_DIR / ".propainter" / "ProPainter",
+))
+PROPAINTER_PYTHON = Path(os.environ.get(
+    "RENDERFIX_PROPAINTER_PYTHON",
+    BACKEND_DIR / ".propainter" / "venv" / "bin" / "python",
+))
+
 # Enable CORS for local React dev server
 app.add_middleware(
     CORSMiddleware,
@@ -28,29 +43,239 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def apply_inpainting(frame, x, y, w, h):
-    """Applies content-aware fill (inpaint) to the specified region."""
-    # Ensure coordinates are within bounds
-    height, width = frame.shape[:2]
-    x = max(0, min(int(x), width))
-    y = max(0, min(int(y), height))
-    w = max(0, min(int(w), width - x))
-    h = max(0, min(int(h), height - y))
+def parse_mask_points(mask_points):
+    """Parse polygon points submitted as a JSON list of [x, y] pairs."""
+    if not mask_points:
+        return None
 
-    if w == 0 or h == 0:
+    points = np.asarray(json.loads(mask_points), dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] != 2 or len(points) < 3:
+        raise ValueError("A polygon mask needs at least three [x, y] points")
+    if not np.isfinite(points).all():
+        raise ValueError("Mask points must be finite numbers")
+    return points
+
+
+def build_removal_masks(frame_shape, x=None, y=None, w=None, h=None, mask_points=None, padding=2, feather=0):
+    """Return the opaque removal mask and the larger area used to generate fill."""
+    height, width = frame_shape[:2]
+    mask = np.zeros((height, width), dtype=np.uint8)
+
+    if mask_points is not None:
+        polygon = np.rint(mask_points).astype(np.int32)
+        polygon[:, 0] = np.clip(polygon[:, 0], 0, width - 1)
+        polygon[:, 1] = np.clip(polygon[:, 1], 0, height - 1)
+        cv2.fillPoly(mask, [polygon], 255)
+    elif None not in (x, y, w, h):
+        x = max(0, min(int(x), width))
+        y = max(0, min(int(y), height))
+        w = max(0, min(int(w), width - x))
+        h = max(0, min(int(h), height - y))
+        if w == 0 or h == 0:
+            return None, None
+        mask[y:y+h, x:x+w] = 255
+    else:
+        return None, None
+
+    if not np.any(mask):
+        return None, None
+
+    padding = max(0, min(int(padding), 128))
+    feather = max(0, min(int(feather), 64))
+    opaque_mask = mask
+    if padding:
+        kernel_size = padding * 2 + 1
+        kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+        opaque_mask = cv2.dilate(mask, kernel, iterations=1)
+
+    inpaint_mask = opaque_mask
+    if feather:
+        kernel_size = feather * 2 + 1
+        kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+        inpaint_mask = cv2.dilate(opaque_mask, kernel, iterations=1)
+
+    return opaque_mask, inpaint_mask
+
+
+def apply_inpainting(frame, x=None, y=None, w=None, h=None, mask_points=None, padding=2, feather=0):
+    """Inpaint a rectangle or polygon mask, with optional expansion and soft edges."""
+    opaque_mask, inpaint_mask = build_removal_masks(
+        frame.shape, x, y, w, h, mask_points, padding, feather
+    )
+    if opaque_mask is None:
         return frame
 
-    # Create a mask for inpainting
-    mask = np.zeros(frame.shape[:2], dtype=np.uint8)
-    mask[y:y+h, x:x+w] = 255
+    inpainted = cv2.inpaint(frame, inpaint_mask, inpaintRadius=5, flags=cv2.INPAINT_NS)
 
-    # Slightly feather/expand the mask edges so the blending is smoother
-    kernel = np.ones((5,5), np.uint8)
-    mask = cv2.dilate(mask, kernel, iterations=1)
+    if feather:
+        # Keep every selected pixel fully replaced; fade only the added outer edge.
+        outside_distance = cv2.distanceTransform(255 - opaque_mask, cv2.DIST_L2, 3)
+        alpha = np.clip(1.0 - outside_distance / (feather + 1.0), 0.0, 1.0)
+        alpha[opaque_mask > 0] = 1.0
+        alpha = alpha[:, :, np.newaxis]
+        return np.clip(frame * (1.0 - alpha) + inpainted * alpha, 0, 255).astype(np.uint8)
 
-    # Apply inpainting (NS typically handles structural blending better for large patches)
-    inpainted = cv2.inpaint(frame, mask, inpaintRadius=5, flags=cv2.INPAINT_NS)
     return inpainted
+
+
+def get_mask_crop_bounds(mask, context=128):
+    """Keep temporal inference local to the selected area while retaining context."""
+    points = cv2.findNonZero(mask)
+    if points is None:
+        raise ValueError("The removal mask is empty")
+    x, y, width, height = cv2.boundingRect(points)
+    margin = max(context, min(256, int(max(width, height) * 1.5)))
+    frame_height, frame_width = mask.shape[:2]
+    left = max(0, x - margin)
+    top = max(0, y - margin)
+    right = min(frame_width, x + width + margin)
+    bottom = min(frame_height, y + height + margin)
+    return left, top, right, bottom
+
+
+def write_video_crop(source_path, crop_path, crop_bounds):
+    """Write a cropped video for inference without changing source timing."""
+    left, top, right, bottom = crop_bounds
+    capture = cv2.VideoCapture(str(source_path))
+    fps = capture.get(cv2.CAP_PROP_FPS)
+    if fps <= 0:
+        fps = 30.0
+    writer = cv2.VideoWriter(
+        str(crop_path), cv2.VideoWriter_fourcc(*"mp4v"), fps,
+        (right - left, bottom - top),
+    )
+    if not capture.isOpened() or not writer.isOpened():
+        capture.release()
+        writer.release()
+        raise RuntimeError("Could not prepare a cropped clip for temporal inpainting")
+
+    frame_count = 0
+    try:
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            writer.write(frame[top:bottom, left:right])
+            frame_count += 1
+    finally:
+        capture.release()
+        writer.release()
+    if frame_count == 0:
+        raise RuntimeError("The uploaded video contains no decodable frames")
+
+
+def run_propainter(video_path, mask_path, output_dir, processing_limit=384):
+    """Run the optional ProPainter installation and return its silent output video."""
+    inference_script = PROPAINTER_DIR / "inference_propainter.py"
+    if not PROPAINTER_PYTHON.is_file() or not inference_script.is_file():
+        raise RuntimeError(
+            "Temporal inpainting is not installed. From the backend folder run "
+            "bash ./setup_propainter.sh, then restart the backend."
+        )
+
+    capture = cv2.VideoCapture(video_path)
+    width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    capture.release()
+    if width <= 0 or height <= 0:
+        raise RuntimeError("Could not read the uploaded video's dimensions")
+
+    factor = min(1.0, processing_limit / max(width, height))
+    process_width = max(8, int(width * factor) // 8 * 8)
+    process_height = max(8, int(height * factor) // 8 * 8)
+    command = [
+        str(PROPAINTER_PYTHON), str(BACKEND_DIR / "propainter_runner.py"),
+        "--video", str(video_path), "--mask", str(mask_path),
+        "--output", str(output_dir),
+        "--width", str(process_width), "--height", str(process_height),
+        # Padding and feather are already rasterized into this mask.
+        "--mask_dilation", "0",
+        "--subvideo_length", "40",
+        "--fp16",
+    ]
+    log_path = Path(output_dir) / "propainter.log"
+    process_env = os.environ.copy()
+    process_env["PYTHONUNBUFFERED"] = "1"
+    with open(log_path, "w", encoding="utf-8") as log_file:
+        completed = subprocess.run(
+            command,
+            cwd=str(PROPAINTER_DIR),
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            env=process_env,
+            check=False,
+        )
+    if completed.returncode != 0:
+        try:
+            details = log_path.read_text(encoding="utf-8", errors="replace")[-3000:]
+        except OSError:
+            details = ""
+        raise RuntimeError(f"ProPainter failed. {details}".strip())
+
+    output_path = Path(output_dir) / Path(video_path).stem / "inpaint_out.mp4"
+    if not output_path.is_file():
+        raise RuntimeError("ProPainter finished without producing an output video")
+    return output_path, process_width, process_height
+
+
+def composite_propainter_video(source_path, filled_path, output_path,
+                               opaque_mask, feather, crop_bounds):
+    """Blend the reduced-resolution fill into only the masked area of source frames."""
+    source = cv2.VideoCapture(str(source_path))
+    filled = cv2.VideoCapture(str(filled_path))
+    width = int(source.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(source.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = source.get(cv2.CAP_PROP_FPS)
+    if fps <= 0:
+        fps = 30.0
+    writer = cv2.VideoWriter(
+        str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
+    )
+    if not source.isOpened() or not filled.isOpened() or not writer.isOpened():
+        source.release()
+        filled.release()
+        writer.release()
+        raise RuntimeError("Could not prepare the ProPainter video for compositing")
+
+    left, top, right, bottom = crop_bounds
+    opaque_mask_crop = opaque_mask[top:bottom, left:right]
+    alpha = (opaque_mask_crop > 0).astype(np.float32)
+    if feather:
+        outside_distance = cv2.distanceTransform(
+            255 - opaque_mask_crop, cv2.DIST_L2, 3
+        )
+        alpha = np.clip(1.0 - outside_distance / (feather + 1.0), 0.0, 1.0)
+        alpha[opaque_mask_crop > 0] = 1.0
+    alpha = alpha[:, :, np.newaxis]
+
+    frame_count = 0
+    try:
+        while True:
+            source_ok, source_frame = source.read()
+            if not source_ok:
+                break
+            filled_ok, filled_frame = filled.read()
+            if not filled_ok:
+                raise RuntimeError("ProPainter output ended before the source video")
+
+            crop_size = (right - left, bottom - top)
+            if filled_frame.shape[:2] != (crop_size[1], crop_size[0]):
+                filled_frame = cv2.resize(
+                    filled_frame, crop_size, interpolation=cv2.INTER_LANCZOS4
+                )
+            source_crop = source_frame[top:bottom, left:right]
+            composed = source_crop * (1.0 - alpha) + filled_frame * alpha
+            source_frame[top:bottom, left:right] = np.clip(composed, 0, 255).astype(np.uint8)
+            writer.write(source_frame)
+            frame_count += 1
+    finally:
+        source.release()
+        filled.release()
+        writer.release()
+
+    if frame_count == 0:
+        raise RuntimeError("No frames were produced by temporal inpainting")
+    return frame_count
 
 @app.post("/api/export/single")
 async def export_single_frame(
@@ -61,7 +286,11 @@ async def export_single_frame(
     x: float = Form(None),
     y: float = Form(None),
     w: float = Form(None),
-    h: float = Form(None)
+    h: float = Form(None),
+    mask_points: str = Form(None),
+    mask_padding: int = Form(2),
+    mask_feather: int = Form(0),
+    compare: bool = Form(False)
 ):
     try:
         # Save uploaded file temporarily
@@ -90,9 +319,25 @@ async def export_single_frame(
         if not ret:
             return JSONResponse(status_code=400, content={"message": "Could not extract frame at given timestamp"})
 
-        # Apply inpainting if coordinates provided
-        if x is not None and y is not None and w is not None and h is not None:
-            frame = apply_inpainting(frame, x, y, w, h)
+        original_frame = frame.copy()
+        polygon_points = parse_mask_points(mask_points)
+
+        if polygon_points is not None or all(value is not None for value in (x, y, w, h)):
+            frame = apply_inpainting(
+                frame, x, y, w, h, polygon_points, mask_padding, mask_feather
+            )
+
+        if compare:
+            image_options = [cv2.IMWRITE_JPEG_QUALITY, 92]
+            original_ok, original_encoded = cv2.imencode('.jpg', original_frame, image_options)
+            processed_ok, processed_encoded = cv2.imencode('.jpg', frame, image_options)
+            if not original_ok or not processed_ok:
+                return JSONResponse(status_code=500, content={"message": "Failed to encode comparison preview"})
+            return JSONResponse(content={
+                "original": base64.b64encode(original_encoded).decode("ascii"),
+                "processed": base64.b64encode(processed_encoded).decode("ascii"),
+                "media_type": "image/jpeg"
+            })
 
         if scale > 1.0:
             new_w = int(frame.shape[1] * scale)
@@ -111,6 +356,7 @@ async def export_single_frame(
     except Exception as e:
         return JSONResponse(status_code=500, content={"message": str(e)})
 
+
 @app.post("/api/export/multiple")
 async def export_multiple(
     file: UploadFile = File(...),
@@ -121,6 +367,9 @@ async def export_multiple(
     y: float = Form(None),
     w: float = Form(None),
     h: float = Form(None),
+    mask_points: str = Form(None),
+    mask_padding: int = Form(2),
+    mask_feather: int = Form(0),
     start_time: float = Form(None),
     end_time: float = Form(None),
     watermark_text: str = Form(None),
@@ -132,6 +381,7 @@ async def export_multiple(
             tmp_video.write(await file.read())
             tmp_video_path = tmp_video.name
 
+        polygon_points = parse_mask_points(mask_points)
         cap = cv2.VideoCapture(tmp_video_path)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         video_fps = cap.get(cv2.CAP_PROP_FPS)
@@ -154,8 +404,10 @@ async def export_multiple(
                 ret, frame = cap.read()
                 if not ret: break
 
-                if x is not None and y is not None and w is not None and h is not None:
-                    frame = apply_inpainting(frame, x, y, w, h)
+                if polygon_points is not None or all(value is not None for value in (x, y, w, h)):
+                    frame = apply_inpainting(
+                        frame, x, y, w, h, polygon_points, mask_padding, mask_feather
+                    )
                     
                 if scale > 1.0:
                     new_w = int(frame.shape[1] * scale)
@@ -218,33 +470,115 @@ async def export_video(
     y: float = Form(None),
     w: float = Form(None),
     h: float = Form(None),
+    mask_points: str = Form(None),
+    mask_padding: int = Form(2),
+    mask_feather: int = Form(0),
     start_time: float = Form(None),
     end_time: float = Form(None),
     watermark_text: str = Form(None),
     watermark_position: str = Form("bottom-right"),
-    format: str = Form("video/mp4")
+    format: str = Form("video/mp4"),
+    processing_method: str = Form("opencv"),
 ):
+    temp_dir = tempfile.mkdtemp(prefix="renderfix-video-")
+    clip = None
+    filled_clip = None
+    new_clip = None
+    out_path = None
     try:
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_in:
-            tmp_in.write(await file.read())
-            tmp_in_path = tmp_in.name
+        if processing_method not in ("opencv", "propainter"):
+            raise ValueError("Unknown video processing method")
+        tmp_in_path = os.path.join(temp_dir, "source.mp4")
+        with open(tmp_in_path, "wb") as tmp_in:
+            shutil.copyfileobj(file.file, tmp_in)
 
         ext = ".gif" if format == "image/gif" else ".mp4"
-        out_path = tempfile.mktemp(suffix=ext)
+        output_handle, out_path = tempfile.mkstemp(suffix=ext)
+        os.close(output_handle)
+        os.remove(out_path)
 
         clip = VideoFileClip(tmp_in_path)
+        polygon_points = parse_mask_points(mask_points)
         
         # Apply trimming if provided
         if start_time is not None or end_time is not None:
             st = max(0, start_time or 0)
             et = min(clip.duration, end_time or clip.duration)
+            if et <= st:
+                raise ValueError("The trim end time must be after the start time")
             clip = clip.subclip(st, et)
+
+        active_clip = clip
+        composite_path = None
+        if processing_method == "propainter":
+            if polygon_points is None and not all(value is not None for value in (x, y, w, h)):
+                raise ValueError("Draw a rectangle or polygon mask before using temporal inpainting")
+            temporal_input_path = os.path.join(temp_dir, "temporal_input.mp4")
+            clip.write_videofile(
+                temporal_input_path,
+                codec="libx264",
+                audio_codec="aac",
+                logger=None,
+            )
+            original_width = int(clip.w)
+            original_height = int(clip.h)
+            opaque_mask, inpaint_mask = build_removal_masks(
+                (original_height, original_width, 3),
+                x,
+                y,
+                w,
+                h,
+                polygon_points,
+                mask_padding,
+                mask_feather,
+            )
+            crop_bounds = get_mask_crop_bounds(inpaint_mask)
+            crop_left, crop_top, crop_right, crop_bottom = crop_bounds
+            crop_width = crop_right - crop_left
+            crop_height = crop_bottom - crop_top
+            processing_limit = 384
+            processing_factor = min(1.0, processing_limit / max(crop_width, crop_height))
+            process_width = max(8, int(crop_width * processing_factor) // 8 * 8)
+            process_height = max(8, int(crop_height * processing_factor) // 8 * 8)
+            propainter_mask = cv2.resize(
+                inpaint_mask[crop_top:crop_bottom, crop_left:crop_right],
+                (process_width, process_height),
+                interpolation=cv2.INTER_NEAREST,
+            )
+            mask_path = os.path.join(temp_dir, "mask.png")
+            if not cv2.imwrite(mask_path, propainter_mask):
+                raise RuntimeError("Could not save the ProPainter mask")
+
+            crop_input_path = os.path.join(temp_dir, "temporal_crop.mp4")
+            write_video_crop(temporal_input_path, crop_input_path, crop_bounds)
+            propainter_output_dir = os.path.join(temp_dir, "propainter_results")
+            os.makedirs(propainter_output_dir, exist_ok=True)
+            filled_path, _, _ = await asyncio.to_thread(
+                run_propainter,
+                crop_input_path,
+                mask_path,
+                propainter_output_dir,
+                processing_limit,
+            )
+            composite_path = os.path.join(temp_dir, "composited.mp4")
+            await asyncio.to_thread(
+                composite_propainter_video,
+                temporal_input_path,
+                filled_path,
+                composite_path,
+                opaque_mask,
+                max(0, min(int(mask_feather), 64)),
+                crop_bounds,
+            )
+            filled_clip = VideoFileClip(composite_path)
+            active_clip = filled_clip
         
-        def process_frame(frame):
+        def process_frame(frame, apply_selected_mask=True):
             bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            if x is not None and y is not None and w is not None and h is not None:
-                bgr = apply_inpainting(bgr, x, y, w, h)
+            if apply_selected_mask and (polygon_points is not None or all(value is not None for value in (x, y, w, h))):
+                bgr = apply_inpainting(
+                    bgr, x, y, w, h, polygon_points, mask_padding, mask_feather
+                )
                 
             if scale > 1.0:
                 new_w = int(bgr.shape[1] * scale)
@@ -277,22 +611,31 @@ async def export_video(
                 
             return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             
-        new_clip = clip.image_transform(process_frame)
+        new_clip = active_clip.image_transform(
+            lambda frame: process_frame(frame, processing_method == "opencv")
+        )
         
         if format == "image/gif":
             new_clip.write_gif(out_path, logger=None, fps=15)
         else:
+            if processing_method == "propainter":
+                if hasattr(new_clip, "with_audio"):
+                    new_clip = new_clip.with_audio(clip.audio)
+                else:
+                    new_clip = new_clip.set_audio(clip.audio)
             new_clip.write_videofile(out_path, codec="libx264", audio_codec="aac", logger=None)
-        
-        clip.close()
-        new_clip.close()
+
+        if new_clip:
+            new_clip.close()
+        if filled_clip:
+            filled_clip.close()
+        if clip:
+            clip.close()
 
         def cleanup():
-            try:
-                if os.path.exists(tmp_in_path): os.remove(tmp_in_path)
-                if os.path.exists(out_path): os.remove(out_path)
-            except Exception:
-                pass
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            if out_path and os.path.exists(out_path):
+                os.remove(out_path)
                 
         background_tasks.add_task(cleanup)
 
@@ -300,6 +643,15 @@ async def export_video(
         return FileResponse(out_path, media_type=format, filename=filename)
 
     except Exception as e:
+        for video_clip in (new_clip, filled_clip, clip):
+            if video_clip:
+                try:
+                    video_clip.close()
+                except Exception:
+                    pass
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        if out_path and os.path.exists(out_path):
+            os.remove(out_path)
         return JSONResponse(status_code=500, content={"message": str(e)})
 
 import fitz

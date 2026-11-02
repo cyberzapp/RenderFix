@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { saveAs } from 'file-saver';
 
-export default function PreviewModal({ blob, filename, originalFile, onClose }) {
+export default function PreviewModal({ blob, filename, originalFile, onClose, previewOnly = false }) {
   const [url, setUrl] = useState(null);
   const [originalUrl, setOriginalUrl] = useState(null);
   const [sliderPos, setSliderPos] = useState(50);
@@ -71,7 +71,7 @@ export default function PreviewModal({ blob, filename, originalFile, onClose }) 
         <div className="flex items-center justify-between p-4 border-b border-slate-800">
           <h2 className="text-xl font-bold text-white flex items-center gap-2">
             <i className="ph-duotone ph-eye text-primary"></i>
-            {showCompare ? "Compare Before / After" : "Preview Result"}
+            {previewOnly ? "Watermark Removal Preview" : showCompare ? "Compare Before / After" : "Preview Result"}
           </h2>
           <button 
             onClick={onClose}
@@ -168,7 +168,18 @@ export default function PreviewModal({ blob, filename, originalFile, onClose }) 
           )}
         </div>
 
-        {/* Footer Actions */}
+        {previewOnly ? (
+          <div className="p-4 border-t border-slate-800 bg-slate-800/30 flex items-center justify-between">
+            <p className="text-sm text-slate-400">Single-frame preview · your video has not been changed</p>
+            <button
+              onClick={onClose}
+              className="px-6 py-2.5 rounded-lg font-medium bg-primary hover:bg-primary-hover text-white transition-colors"
+            >
+              Back to editing
+            </button>
+          </div>
+        ) : (
+        /* Footer Actions */
         <div className="p-4 border-t border-slate-800 bg-slate-800/30 flex items-center justify-between">
           <div className="text-sm text-slate-400 flex items-center gap-2">
             <i className="ph-fill ph-file text-slate-500"></i>
@@ -194,6 +205,7 @@ export default function PreviewModal({ blob, filename, originalFile, onClose }) 
             </button>
           </div>
         </div>
+        )}
       </div>
     </div>
   );
